@@ -41,52 +41,12 @@ export interface CartLine {
   lineTotal: number;
 }
 
-export type OrderStatus = "received" | "preparing" | "ready" | "completed";
-
+// Order/Customer/CateringLead types used to live here as a client-only
+// localStorage model. That model is gone — the server (src/server/*) is now
+// the single source of truth for orders, customers, and catering leads.
+// Import OrderDTO / OrderStatus from "@/server/types" (type-only) instead.
 export type FulfillmentType = "asap" | "scheduled";
 export type PaymentMethod = "online" | "pickup";
-
-export interface Order {
-  id: string;
-  customerName: string;
-  phone: string;
-  items: CartLine[];
-  subtotal: number;
-  tax: number;
-  total: number;
-  fulfillment: FulfillmentType;
-  scheduledTime?: string;
-  paymentMethod: PaymentMethod;
-  status: OrderStatus;
-  createdAt: number;
-  estimatedReadyAt: number;
-  isDemo?: boolean;
-  reviewRequested?: boolean;
-}
-
-export interface Customer {
-  id: string;
-  name: string;
-  phone: string;
-  totalOrders: number;
-  totalSpent: number;
-  lastOrderAt: number;
-  favoriteItem: string;
-}
-
-export interface CateringLead {
-  id: string;
-  name: string;
-  phone: string;
-  email: string;
-  eventDate: string;
-  guests: string;
-  location: string;
-  budget: string;
-  preferences: string;
-  message: string;
-  createdAt: number;
-}
 
 export interface ToastMessage {
   id: string;

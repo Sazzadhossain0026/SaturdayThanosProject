@@ -1,10 +1,31 @@
 "use client";
 
-import { useApp } from "@/lib/store";
+import { useEffect, useState } from "react";
+import { fetchCateringLeads } from "@/lib/api-client";
 import { formatDateTime } from "@/lib/format";
+import type { CateringLeadDTO } from "@/server/catering";
 
 export default function CateringLeadsPage() {
-  const { state } = useApp();
+  const [leads, setLeads] = useState<CateringLeadDTO[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      try {
+        const { leads } = await fetchCateringLeads();
+        if (!cancelled) setLeads(leads);
+      } catch {
+        if (!cancelled) setError("Couldn't reach the server.");
+      }
+    }
+    load();
+    const id = window.setInterval(load, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, []);
 
   return (
     <div>
@@ -12,16 +33,17 @@ export default function CateringLeadsPage() {
         Catering Leads
       </h1>
       <p className="text-sm text-brand-ink/50">
-        {state.cateringLeads.length} requests submitted via the catering form
+        {leads.length} requests submitted via the catering form
       </p>
+      {error && <p className="mt-2 rounded-xl bg-red-50 px-3 py-2 text-xs font-semibold text-red-600">⚠️ {error}</p>}
 
       <div className="mt-5 space-y-3">
-        {state.cateringLeads.length === 0 && (
+        {leads.length === 0 && (
           <p className="rounded-2xl border border-dashed border-black/10 p-6 text-center text-sm text-brand-ink/40">
             No catering requests yet.
           </p>
         )}
-        {state.cateringLeads.map((lead) => (
+        {leads.map((lead) => (
           <div
             key={lead.id}
             className="rounded-2xl bg-white p-4 shadow-sm ring-1 ring-black/5"

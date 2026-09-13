@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { useApp } from "@/lib/store";
+import { submitCateringLead } from "@/lib/api-client";
 
 const inputClass =
   "mt-1 w-full rounded-xl border border-black/10 px-3.5 py-3 text-sm outline-none focus:border-brand-orange";
@@ -20,18 +20,28 @@ const initialForm = {
 };
 
 export default function CateringPage() {
-  const { addCateringLead } = useApp();
   const [form, setForm] = useState(initialForm);
   const [submitted, setSubmitted] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   function update<K extends keyof typeof initialForm>(key: K, value: string) {
     setForm((prev) => ({ ...prev, [key]: value }));
   }
 
-  function handleSubmit(e: React.FormEvent) {
+  async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    addCateringLead(form);
-    setSubmitted(true);
+    if (submitting) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      await submitCateringLead(form);
+      setSubmitted(true);
+    } catch {
+      setError("Couldn't send your request — check your connection and try again.");
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   if (submitted) {
@@ -155,11 +165,16 @@ export default function CateringPage() {
           />
         </Field>
 
+        {error && (
+          <p className="rounded-xl bg-red-50 px-3 py-2 text-xs font-semibold text-red-600">⚠️ {error}</p>
+        )}
+
         <button
           type="submit"
-          className="w-full rounded-2xl bg-brand-orange py-4 font-bold text-white shadow-md active:scale-[0.98]"
+          disabled={submitting}
+          className="w-full rounded-2xl bg-brand-orange py-4 font-bold text-white shadow-md active:scale-[0.98] disabled:opacity-50"
         >
-          Submit Catering Request
+          {submitting ? "Sending…" : "Submit Catering Request"}
         </button>
       </form>
     </main>

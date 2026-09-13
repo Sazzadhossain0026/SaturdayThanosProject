@@ -6,12 +6,18 @@ import { formatCurrency } from "@/lib/format";
 export function MenuItemCard({
   item,
   onSelect,
+  stockLeft,
 }: {
   item: MenuItem;
   onSelect: (item: MenuItem) => void;
+  /** Only passed for the handful of intentionally-limited items — see /api/inventory. undefined = unlimited. */
+  stockLeft?: number;
 }) {
+  const soldOut = stockLeft === 0;
   return (
-    <div className="flex gap-3 rounded-2xl bg-white p-3 shadow-sm ring-1 ring-black/5 transition-shadow hover:shadow-md">
+    <div
+      className={`flex gap-3 rounded-2xl bg-white p-3 shadow-sm ring-1 ring-black/5 transition-shadow hover:shadow-md ${soldOut ? "opacity-60" : ""}`}
+    >
       <div
         className={`flex h-20 w-20 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br text-3xl ${item.gradient}`}
       >
@@ -37,12 +43,23 @@ export function MenuItemCard({
                 Popular
               </span>
             )}
+            {typeof stockLeft === "number" && stockLeft > 0 && (
+              <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-700">
+                {stockLeft} left today
+              </span>
+            )}
+            {soldOut && (
+              <span className="rounded-full bg-black/10 px-2 py-0.5 text-[10px] font-bold text-brand-ink/50">
+                Sold Out
+              </span>
+            )}
           </div>
           <button
             onClick={() => onSelect(item)}
-            className="rounded-full bg-brand-teal px-4 py-1.5 text-xs font-bold text-white active:scale-95"
+            disabled={soldOut}
+            className="rounded-full bg-brand-teal px-4 py-1.5 text-xs font-bold text-white active:scale-95 disabled:cursor-not-allowed disabled:bg-black/20"
           >
-            Add
+            {soldOut ? "Sold Out" : "Add"}
           </button>
         </div>
       </div>

@@ -1,15 +1,17 @@
-import { OrderStatus } from "@/lib/types";
+import type { OrderStatus } from "@/server/types";
 
 const STEPS: { key: OrderStatus; label: string; icon: string }[] = [
-  { key: "received", label: "Order Received", icon: "🧾" },
+  { key: "confirmed", label: "Order Received", icon: "🧾" },
   { key: "preparing", label: "Preparing", icon: "👨‍🍳" },
   { key: "ready", label: "Ready for Pickup", icon: "🥡" },
 ];
 
-const ORDER: OrderStatus[] = ["received", "preparing", "ready", "completed"];
+const ORDER: OrderStatus[] = ["pending_payment", "confirmed", "preparing", "ready", "completed"];
 
 export function OrderStatusTracker({ status }: { status: OrderStatus }) {
-  const currentIdx = ORDER.indexOf(status);
+  // payment_failed/cancelled aren't points on this forward progression —
+  // treat them as "nothing achieved yet" so every step renders as pending.
+  const currentIdx = status === "payment_failed" || status === "cancelled" ? -1 : ORDER.indexOf(status);
 
   return (
     <div>
