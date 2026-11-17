@@ -24,7 +24,7 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const { order, paymentIntent } = createOrder(body);
+    const { order, paymentIntent } = await createOrder(body);
     return NextResponse.json({ order, paymentIntent }, { status: 201 });
   } catch (err) {
     if (err instanceof SoldOutError) {

@@ -203,3 +203,23 @@ export async function fetchInventory() {
     "/api/inventory",
   );
 }
+
+export async function fetchMe() {
+  return fetchJson<{ user: import("@/server/auth").SessionUser | null }>("/api/auth/me");
+}
+
+export async function logoutSession() {
+  return fetchJson<{ ok: true }>("/api/auth/logout", { method: "POST" });
+}
+
+export async function fetchStaffUsers() {
+  return fetchJson<{ users: import("@/server/auth").PublicUser[] }>("/api/auth/users");
+}
+
+export async function createStaffUser(input: { email: string; password: string; role: "owner" | "staff" }) {
+  return fetchJson<{ ok: true }>("/api/auth/users", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}

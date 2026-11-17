@@ -12,7 +12,7 @@ export async function POST(request: NextRequest) {
   const rawBody = await request.text();
   const signature = request.headers.get("stripe-signature");
 
-  const result = verifyAndHandleRawStripeWebhook(rawBody, signature);
+  const result = await verifyAndHandleRawStripeWebhook(rawBody, signature);
   if (!result.ok) {
     // Stripe retries on non-2xx, but a bad signature should never be
     // retried into validity — 400 it and log, don't 500.

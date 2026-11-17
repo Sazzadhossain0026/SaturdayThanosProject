@@ -1,10 +1,12 @@
 "use client";
 
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { OrderCard } from "@/components/order/OrderCard";
 import type { OrderDTO, OrderStatus } from "@/server/types";
 import { usePolledOrders } from "@/lib/use-kitchen-orders";
+import { SessionBar } from "@/components/auth/SessionBar";
+import { fetchMe } from "@/lib/api-client";
 
 /**
  * Standalone kitchen-facing view — a phone or tablet propped up by the
@@ -22,6 +24,13 @@ const COLUMNS: { status: OrderStatus; label: string; icon: string }[] = [
 
 export default function KitchenViewPage() {
   const { orders, loading, error, runAction } = usePolledOrders(2500);
+  const [isOwner, setIsOwner] = useState(false);
+
+  useEffect(() => {
+    fetchMe()
+      .then((res) => setIsOwner(res.user?.role === "owner"))
+      .catch(() => {});
+  }, []);
 
   const grouped = useMemo(() => {
     const map: Record<OrderStatus, OrderDTO[]> = {
@@ -51,10 +60,13 @@ export default function KitchenViewPage() {
           </div>
         </div>
         <div className="flex items-center gap-3 text-xs text-white/70">
-          <span>{completedToday} done today</span>
-          <Link href="/admin" className="rounded-full bg-white/10 px-3 py-1.5 font-semibold text-white">
-            Owner View
-          </Link>
+          <span className="hidden sm:inline">{completedToday} done today</span>
+          {isOwner && (
+            <Link href="/admin" className="rounded-full bg-white/10 px-3 py-1.5 font-semibold text-white">
+              Owner View
+            </Link>
+          )}
+          <SessionBar />
         </div>
       </header>
 

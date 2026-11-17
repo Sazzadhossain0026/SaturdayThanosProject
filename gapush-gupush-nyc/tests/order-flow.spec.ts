@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
-import { resetDemo } from "./helpers/api";
-import { getSmsEventsForOrder, openTestDb } from "./helpers/db";
+import { loginAsOwner, resetDemo } from "./helpers/api";
+import { getSmsEventsForOrder } from "./helpers/db";
 import { TEST_ENV } from "../playwright.config";
 
 /**
@@ -62,6 +62,10 @@ test("scan → order 3 items → pay → kitchen sees it → ready → both SMS 
   await expect(page.getByText(orderNumber)).toBeVisible();
 
   // --- Order appears on the kitchen view ---
+  // /kitchen is auth-gated (src/proxy.ts) — log in on the page's own
+  // browser context (page.request shares its cookie jar) before navigating
+  // there, same as any real staff member would.
+  await loginAsOwner(page.request);
   await page.goto("/kitchen");
   const kitchenCard = page.locator(".rounded-2xl.bg-white", { hasText: orderNumber });
   await expect(kitchenCard).toBeVisible({ timeout: 10_000 });
@@ -85,33 +89,30 @@ test("scan → order 3 items → pay → kitchen sees it → ready → both SMS 
   const orderRes = await request.get(`/api/orders/${orderNumber}`);
   const { order } = await orderRes.json();
 
-  const db = openTestDb();
-  try {
-    await expect
-      .poll(() => getSmsEventsForOrder(db, order.id).length, { timeout: 5000 })
-      .toBeGreaterThanOrEqual(2);
+  await expect
+    .poll(async () => (await getSmsEventsForOrder(order.id)).length, { timeout: 5000 })
+    .toBeGreaterThanOrEqual(2);
 
-    const sms = getSmsEventsForOrder(db, order.id);
-    const received = sms.find((s) => s.kind === "order_received");
-    const ready = sms.find((s) => s.kind === "order_ready");
+  const sms = await getSmsEventsForOrder(order.id);
+  const received = sms.find((s) => s.kind === "order_received");
+  const ready = sms.find((s) => s.kind === "order_ready");
 
-    expect(received, "order-received SMS should have been sent").toBeTruthy();
-    expect(received!.to_phone).toBe("9175559876");
-    expect(received!.body).toBe(`Gapush Gupush: We received order ${orderNumber}. We'll text you when it's ready.`);
+  expect(received, "order-received SMS should have been sent").toBeTruthy();
+  expect(received!.to_phone).toBe("9175559876");
+  expect(received!.body).toBe(`Gapush Gupush: We received order ${orderNumber}. We'll text you when it's ready.`);
 
-    expect(ready, "order-ready SMS should have been sent").toBeTruthy();
-    expect(ready!.to_phone).toBe("9175559876");
-    expect(ready!.body).toBe(`Gapush Gupush: Your order ${orderNumber} is READY for pickup!`);
+  expect(ready, "order-ready SMS should have been sent").toBeTruthy();
+  expect(ready!.to_phone).toBe("9175559876");
+  expect(ready!.body).toBe(`Gapush Gupush: Your order ${orderNumber} is READY for pickup!`);
 
-    // Twilio's status-callback loop (see mock-twilio.ts) should have
-    // marked both delivered — proves the inbound webhook side works too,
-    // not just outbound sending.
-    await expect
-      .poll(() => getSmsEventsForOrder(db, order.id).every((s) => s.status === "delivered"), { timeout: 3000 })
-      .toBe(true);
-  } finally {
-    db.close();
-  }
+  // Twilio's status-callback loop (see mock-twilio.ts) should have marked
+  // both delivered — proves the inbound webhook side works too, not just
+  // outbound sending.
+  await expect
+    .poll(async () => (await getSmsEventsForOrder(order.id)).every((s) => s.status === "delivered"), {
+      timeout: 3000,
+    })
+    .toBe(true);
 });
 
 async function addItemToCart(page: import("@playwright/test").Page, itemName: string, spiceLevel: string) {

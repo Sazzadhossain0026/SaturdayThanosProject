@@ -21,7 +21,7 @@ export async function POST(request: NextRequest) {
   // itself (separate from the webhook delay in mock-stripe.ts).
   await new Promise((resolve) => setTimeout(resolve, 500 + Math.random() * 400));
 
-  const result = confirmPaymentIntent(body.paymentIntentId, body.cardNumber);
+  const result = await confirmPaymentIntent(body.paymentIntentId, body.cardNumber);
   if (result.outcome === "decline") {
     return NextResponse.json({ outcome: "decline", code: result.code, message: result.message }, { status: 402 });
   }

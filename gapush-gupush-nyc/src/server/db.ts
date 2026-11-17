@@ -1,44 +1,43 @@
-import Database from "better-sqlite3";
-import path from "path";
-import fs from "fs";
+import { Pool, types } from "pg";
 import { MENU_ITEMS } from "@/lib/menu-data";
 
 /**
  * ---------------------------------------------------------------------------
- * SIMULATED BACKEND — read this before assuming anything here is "real"
+ * REAL POSTGRES — this replaced the earlier SQLite-file simulation.
  * ---------------------------------------------------------------------------
- * There is no Supabase project, no Stripe account, and no Twilio account
- * behind this app. This file stands in for a Supabase/Postgres database
- * using SQLite with the *same table shapes* documented in CLAUDE.md, so the
- * schema, the order state machine, and the webhook idempotency patterns are
- * all real and testable — they just don't talk to the real internet.
+ * Run `docker compose up -d` (see docker-compose.yml at the repo root) to
+ * start it locally. DATABASE_URL defaults to that compose file's
+ * credentials, so a fresh `npm run dev` after `docker compose up -d` just
+ * works with no extra config.
  *
- * If/when this becomes a real product, this file is what gets replaced by
- * an actual Supabase client; the SQL below is written close enough to
- * Postgres that the migration in CLAUDE.md should port with minimal changes.
+ * Stripe and Twilio are still simulated (see mock-stripe.ts / mock-twilio.ts
+ * and CLAUDE.md) — only the database became real. If this ever deploys for
+ * real, point DATABASE_URL at a hosted Postgres (Supabase, RDS, etc.) —
+ * nothing else in this file needs to change.
  * ---------------------------------------------------------------------------
  */
 
-const DATA_DIR = path.join(process.cwd(), ".data");
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-const DB_PATH = path.join(DATA_DIR, "gapush.db");
+// node-postgres returns BIGINT (OID 20) as a string by default, to avoid
+// silently losing precision on values bigger than Number.MAX_SAFE_INTEGER.
+// Our BIGINT columns are all epoch-millisecond timestamps (~13 digits),
+// nowhere near that ceiling, so converting to a plain number is safe and
+// much more convenient than threading strings through every call site.
+types.setTypeParser(20, (val: string) => parseInt(val, 10));
 
-// A single shared connection per server process. better-sqlite3 is
-// synchronous, so there is no connection-pool interleaving to worry about —
-// every statement below runs to completion before the next one starts,
-// which is what makes the inventory fix in inventory.ts actually atomic.
+const connectionString =
+  process.env.DATABASE_URL ??
+  "postgresql://gapush:gapush_dev_password@localhost:5433/gapush_gupush";
+
 declare global {
-  var __gapushDb: Database.Database | undefined;
+  var __gapushPool: Pool | undefined;
 }
 
-export const db: Database.Database = global.__gapushDb ?? new Database(DB_PATH);
-if (!global.__gapushDb) {
-  global.__gapushDb = db;
-  db.pragma("journal_mode = WAL");
-  db.pragma("foreign_keys = ON");
+export const pool: Pool = global.__gapushPool ?? new Pool({ connectionString });
+if (!global.__gapushPool) {
+  global.__gapushPool = pool;
 }
 
-db.exec(`
+const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS counters (
   name TEXT PRIMARY KEY,
   value INTEGER NOT NULL
@@ -47,7 +46,7 @@ CREATE TABLE IF NOT EXISTS counters (
 CREATE TABLE IF NOT EXISTS inventory (
   menu_item_id TEXT PRIMARY KEY,
   quantity_available INTEGER NOT NULL,
-  is_limited INTEGER NOT NULL DEFAULT 0
+  is_limited BOOLEAN NOT NULL DEFAULT false
 );
 
 CREATE TABLE IF NOT EXISTS orders (
@@ -63,10 +62,10 @@ CREATE TABLE IF NOT EXISTS orders (
   subtotal_cents INTEGER NOT NULL,
   tax_cents INTEGER NOT NULL,
   total_cents INTEGER NOT NULL,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL,
-  estimated_ready_at INTEGER NOT NULL,
-  is_demo INTEGER NOT NULL DEFAULT 0,
+  created_at BIGINT NOT NULL,
+  updated_at BIGINT NOT NULL,
+  estimated_ready_at BIGINT NOT NULL,
+  is_demo BOOLEAN NOT NULL DEFAULT false,
   idempotency_key TEXT UNIQUE
 );
 
@@ -88,17 +87,17 @@ CREATE TABLE IF NOT EXISTS payment_intents (
   order_id TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
   amount_cents INTEGER NOT NULL,
   status TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at BIGINT NOT NULL
 );
 
 -- Idempotency ledger for inbound Stripe webhooks. The UNIQUE constraint on
 -- stripe_event_id is the actual fix for "webhook arrives twice": the second
--- insert fails, we detect that, and skip reprocessing.
+-- insert is ignored, we detect that, and skip reprocessing.
 CREATE TABLE IF NOT EXISTS payment_events (
   stripe_event_id TEXT PRIMARY KEY,
   type TEXT NOT NULL,
   payment_intent_id TEXT,
-  received_at INTEGER NOT NULL
+  received_at BIGINT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sms_events (
@@ -109,7 +108,7 @@ CREATE TABLE IF NOT EXISTS sms_events (
   kind TEXT NOT NULL,
   twilio_sid TEXT UNIQUE NOT NULL,
   status TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at BIGINT NOT NULL
 );
 
 -- Idempotency ledger for inbound Twilio status-callback webhooks.
@@ -117,7 +116,7 @@ CREATE TABLE IF NOT EXISTS sms_status_events (
   id TEXT PRIMARY KEY,
   twilio_sid TEXT NOT NULL,
   status TEXT NOT NULL,
-  received_at INTEGER NOT NULL,
+  received_at BIGINT NOT NULL,
   UNIQUE(twilio_sid, status)
 );
 
@@ -132,45 +131,137 @@ CREATE TABLE IF NOT EXISTS catering_leads (
   budget TEXT,
   preferences TEXT,
   message TEXT,
-  created_at INTEGER NOT NULL
+  created_at BIGINT NOT NULL
 );
-`);
 
-function seedInventoryIfEmpty() {
-  const count = (db.prepare("SELECT COUNT(*) as c FROM inventory").get() as { c: number }).c;
-  if (count > 0) return;
-  const insert = db.prepare(
-    "INSERT INTO inventory (menu_item_id, quantity_available, is_limited) VALUES (?, ?, ?)",
-  );
-  const seedAll = db.transaction(() => {
-    for (const item of MENU_ITEMS) {
-      // "Naga Shingara" is deliberately scarce so the race-condition demo
-      // (two customers, one last item) has something real to contend over.
-      const isLimited = item.id === "naga-shingara";
-      insert.run(item.id, isLimited ? 3 : 999, isLimited ? 1 : 0);
-    }
-  });
-  seedAll();
+-- Auth: staff/owner accounts. Never touched by resetDemoData() — a demo
+-- reset clears orders/payments/SMS/catering, not who's allowed to log in.
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL, -- 'owner' | 'staff'
+  created_at BIGINT NOT NULL
+);
+
+-- Opaque, DB-backed sessions (not JWTs) so a logout or revocation takes
+-- effect immediately — deleting the row invalidates the cookie.
+CREATE TABLE IF NOT EXISTS sessions (
+  token TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at BIGINT NOT NULL,
+  expires_at BIGINT NOT NULL
+);
+
+-- Minimal brute-force guard on /api/auth/login.
+CREATE TABLE IF NOT EXISTS login_attempts (
+  email TEXT PRIMARY KEY,
+  failed_count INTEGER NOT NULL DEFAULT 0,
+  locked_until BIGINT
+);
+`;
+
+let schemaReady: Promise<void> | null = null;
+
+export function ensureSchema(): Promise<void> {
+  if (!schemaReady) {
+    schemaReady = initSchema();
+  }
+  return schemaReady;
 }
-seedInventoryIfEmpty();
 
-function seedCounterIfMissing() {
-  const row = db.prepare("SELECT value FROM counters WHERE name = 'order_number'").get();
-  if (!row) {
-    // claimNextOrderNumber() does `value = value + 1` and returns the new
-    // value, so seeding 1041 makes the very first claimed order GG-1042.
-    db.prepare("INSERT INTO counters (name, value) VALUES ('order_number', ?)").run(1041);
+async function initSchema(): Promise<void> {
+  await pool.query(SCHEMA_SQL);
+  await seedInventoryIfEmpty();
+  await seedCounterIfMissing();
+}
+
+async function seedInventoryIfEmpty(): Promise<void> {
+  const { rows } = await pool.query<{ c: string }>("SELECT COUNT(*)::int as c FROM inventory");
+  if (Number(rows[0].c) > 0) return;
+  for (const item of MENU_ITEMS) {
+    // "Naga Shingara" is deliberately scarce so the race-condition demo
+    // (two customers, one last item) has something real to contend over.
+    const isLimited = item.id === "naga-shingara";
+    await pool.query(
+      "INSERT INTO inventory (menu_item_id, quantity_available, is_limited) VALUES ($1, $2, $3)",
+      [item.id, isLimited ? 3 : 999, isLimited],
+    );
   }
 }
-seedCounterIfMissing();
 
-export function resetDemoData() {
-  const reset = db.transaction(() => {
-    db.exec(
-      "DELETE FROM sms_status_events; DELETE FROM sms_events; DELETE FROM payment_events; DELETE FROM payment_intents; DELETE FROM order_items; DELETE FROM orders; DELETE FROM catering_leads; DELETE FROM inventory;",
+async function seedCounterIfMissing(): Promise<void> {
+  const { rows } = await pool.query("SELECT value FROM counters WHERE name = 'order_number'");
+  if (rows.length === 0) {
+    // claimNextOrderNumber() does `value = value + 1` and returns the new
+    // value, so seeding 1041 makes the very first claimed order GG-1042.
+    await pool.query("INSERT INTO counters (name, value) VALUES ('order_number', 1041)");
+  }
+}
+
+/**
+ * Wipes all *demo* data (orders, payments, SMS, catering leads, inventory)
+ * and reseeds inventory + the order-number counter. Deliberately does NOT
+ * touch users/sessions/login_attempts — resetting the demo should never
+ * log the owner out or delete staff accounts.
+ */
+export async function resetDemoData(): Promise<void> {
+  await ensureSchema();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      "TRUNCATE sms_status_events, sms_events, payment_events, payment_intents, order_items, orders, catering_leads, inventory",
     );
-    db.prepare("UPDATE counters SET value = 1041 WHERE name = 'order_number'").run();
-  });
-  reset();
-  seedInventoryIfEmpty();
+    await client.query("UPDATE counters SET value = 1041 WHERE name = 'order_number'");
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+  await seedInventoryIfEmpty();
+}
+
+/** Simple one-off query helper — ensures the schema exists first. */
+export async function query<T = Record<string, unknown>>(
+  text: string,
+  params: unknown[] = [],
+): Promise<T[]> {
+  await ensureSchema();
+  const result = await pool.query(text, params);
+  return result.rows as T[];
+}
+
+export interface DbClient {
+  query<T = Record<string, unknown>>(
+    text: string,
+    params?: unknown[],
+  ): Promise<{ rows: T[]; rowCount: number | null }>;
+}
+
+/**
+ * Runs `fn` inside a single Postgres transaction (BEGIN/COMMIT/ROLLBACK on
+ * one pooled client). better-sqlite3's db.transaction() let callers nest
+ * transactions implicitly via savepoints; plain `pg` doesn't, so instead
+ * every server function that needs to participate in a caller's
+ * transaction accepts an optional `client` parameter and uses it instead
+ * of opening its own — see orders.ts's createOrder() calling
+ * reserveInventory(client, ...) for the pattern.
+ */
+export async function withTransaction<T>(fn: (client: DbClient) => Promise<T>): Promise<T> {
+  await ensureSchema();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await fn(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }

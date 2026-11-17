@@ -1,16 +1,26 @@
-import Database from "better-sqlite3";
-import path from "path";
+import { Client, types } from "pg";
+import { TEST_ENV } from "../../playwright.config";
 
 /**
- * Tests read the same SQLite file the app writes to (see src/server/db.ts)
- * so we can assert on things the UI never surfaces directly — e.g. the
- * exact SMS body text Twilio would have been asked to send, or that a
- * duplicate webhook really did no-op at the payment_events level.
+ * Tests read the same Postgres database the app writes to for this run
+ * (see src/server/db.ts / playwright.config.ts's TEST_ENV.DATABASE_URL) so
+ * we can assert on things the UI never surfaces directly — e.g. the exact
+ * SMS body text Twilio would have been asked to send, or that a duplicate
+ * webhook really did no-op at the payment_events level.
  */
-const DB_PATH = path.join(process.cwd(), ".data", "gapush.db");
 
-export function openTestDb(): Database.Database {
-  return new Database(DB_PATH, { readonly: false, fileMustExist: false });
+// Same reasoning as src/server/db.ts: BIGINT (oid 20) columns here are all
+// epoch-millisecond timestamps, safely within Number range.
+types.setTypeParser(20, (val: string) => parseInt(val, 10));
+
+async function withClient<T>(fn: (client: Client) => Promise<T>): Promise<T> {
+  const client = new Client({ connectionString: TEST_ENV.DATABASE_URL });
+  await client.connect();
+  try {
+    return await fn(client);
+  } finally {
+    await client.end();
+  }
 }
 
 export interface SmsEventRow {
@@ -24,16 +34,22 @@ export interface SmsEventRow {
   created_at: number;
 }
 
-export function getSmsEventsForOrder(db: Database.Database, orderId: string): SmsEventRow[] {
-  return db
-    .prepare("SELECT * FROM sms_events WHERE order_id = ? ORDER BY created_at ASC")
-    .all(orderId) as SmsEventRow[];
+export async function getSmsEventsForOrder(orderId: string): Promise<SmsEventRow[]> {
+  return withClient(async (client) => {
+    const { rows } = await client.query<SmsEventRow>(
+      "SELECT * FROM sms_events WHERE order_id = $1 ORDER BY created_at ASC",
+      [orderId],
+    );
+    return rows;
+  });
 }
 
-export function getPaymentEventCount(db: Database.Database, paymentIntentId: string): number {
-  return (
-    db
-      .prepare("SELECT COUNT(*) as c FROM payment_events WHERE payment_intent_id = ?")
-      .get(paymentIntentId) as { c: number }
-  ).c;
+export async function getPaymentEventCount(paymentIntentId: string): Promise<number> {
+  return withClient(async (client) => {
+    const { rows } = await client.query<{ c: number }>(
+      "SELECT COUNT(*)::int as c FROM payment_events WHERE payment_intent_id = $1",
+      [paymentIntentId],
+    );
+    return rows[0].c;
+  });
 }

@@ -4,25 +4,31 @@ A mobile-first sales demo / prototype for **Gapush Gupush NYC**, an
 authentic Bangladeshi street food business. Built with Next.js (App
 Router), TypeScript, and Tailwind CSS.
 
-There is no real Stripe account, Twilio account, or Supabase project
-behind this — payments and SMS are simulated locally (SQLite + a
-Stripe/Twilio-shaped mock layer) so the order state machine, webhooks, and
-race-condition fixes are real and testable without needing anyone's
-credentials. See **[CLAUDE.md](./CLAUDE.md)** for the full architecture,
-schema, and webhook reference — start there if you're touching
+There is no real Stripe account or Twilio account behind this — payments
+and SMS are simulated (a Stripe/Twilio-shaped mock layer) so the order
+state machine, webhooks, and race-condition fixes are real and testable
+without needing anyone's credentials. The database and the auth system,
+though, are real: a real Postgres server and real login-gated access to
+customer data. See **[CLAUDE.md](./CLAUDE.md)** for the full architecture,
+schema, auth model, and webhook reference — start there if you're touching
 `src/server/*` or the checkout flow.
 
 ## Running it
 
 ```bash
+docker compose up -d   # starts Postgres on localhost:5433
 npm install
 npm run dev
 ```
 
-Then open http://localhost:3000. A `.data/gapush.db` SQLite file is
-created on first run (git-ignored) — delete it to reset to a clean slate,
-or use `/demo-reset?key=letmein` for a one-tap reset without restarting
-the server.
+Then open http://localhost:3000. The schema is created automatically on
+first request, and a default owner account is seeded (`owner@gapushgupush.nyc`
+/ `ChangeMe123!` unless you set `OWNER_EMAIL`/`OWNER_PASSWORD` — see
+`.env.example`). Sign in at **http://localhost:3000/login** to reach
+`/admin` or `/kitchen` — both require a staff login now; see CLAUDE.md →
+"Auth". Use `/demo-reset?key=letmein` for a one-tap reset of orders/
+payments/SMS/catering data without restarting the server (it never touches
+staff accounts).
 
 ## What's inside
 
@@ -42,19 +48,23 @@ the server.
   Preparing → Ready) and simulated SMS + review-request toasts.
 - Catering request form that also shows up in the owner dashboard.
 
-**Kitchen view** (`/kitchen`) — standalone, big-touch-target screen for a
-phone/tablet at the counter: New / Preparing / Ready columns with one-tap
-Accept / Mark Ready / Mark Completed.
+**Kitchen view** (`/kitchen`, owner or staff login required) —
+standalone, big-touch-target screen for a phone/tablet at the counter:
+New / Preparing / Ready columns with one-tap Accept / Mark Ready / Mark
+Completed.
 
-**Owner dashboard** (`/admin/*`)
+**Owner dashboard** (`/admin/*`, owner login required)
 - Overview stats (today's orders/sales/average/waiting/completed — live
   from the real order table).
 - Order Queue kanban (Awaiting Payment / New / Preparing / Ready /
   Completed) with the same kitchen actions as `/kitchen`.
 - Business Insights charts (daily sales, orders by hour, top sellers).
-- Customer CRM aggregated from real order history, with a "Send
-  Promotion" demo action.
+- Customer CRM aggregated from real order history — search by name/phone,
+  filter by order count, sort, and export the visible list to CSV — with
+  a "Send Promotion" demo action.
 - Catering leads list.
+- Staff Accounts — add owner/staff logins (no public signup anywhere in
+  the app).
 
 **Demo Mode** — a floating "DEMO" control lets you create a scripted
 demo order, fast-forward it through Preparing → Ready → Completed, and

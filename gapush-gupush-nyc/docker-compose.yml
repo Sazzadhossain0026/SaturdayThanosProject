@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: gapush-gupush-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: gapush
+      POSTGRES_PASSWORD: gapush_dev_password
+      POSTGRES_DB: gapush_gupush
+    ports:
+      - "5433:5432"
+    volumes:
+      - gapush-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gapush -d gapush_gupush"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  gapush-postgres-data:

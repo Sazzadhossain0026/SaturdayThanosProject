@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { AdminNav } from "@/components/admin/AdminNav";
+import { SessionBar } from "@/components/auth/SessionBar";
 
 export default function AdminLayout({ children }: { children: React.ReactNode }) {
   return (
@@ -18,12 +19,15 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
             </span>
           </span>
         </Link>
-        <Link
-          href="/"
-          className="rounded-full bg-white/10 px-3 py-1.5 text-xs font-semibold text-white"
-        >
-          Customer App ↗
-        </Link>
+        <div className="flex items-center gap-3">
+          <Link
+            href="/"
+            className="rounded-full bg-white/10 px-3 py-1.5 text-xs font-semibold text-white"
+          >
+            Customer App ↗
+          </Link>
+          <SessionBar />
+        </div>
       </header>
 
       <div className="mx-auto flex max-w-6xl gap-6 px-4 py-6 pb-24 md:pb-6">

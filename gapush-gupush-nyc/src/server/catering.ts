@@ -1,5 +1,5 @@
 import crypto from "crypto";
-import { db } from "./db";
+import { query } from "./db";
 
 export interface CateringLeadInput {
   name: string;
@@ -18,31 +18,32 @@ export interface CateringLeadDTO extends CateringLeadInput {
   createdAt: number;
 }
 
-export function createCateringLead(input: CateringLeadInput): CateringLeadDTO {
+export async function createCateringLead(input: CateringLeadInput): Promise<CateringLeadDTO> {
   const id = crypto.randomUUID();
   const createdAt = Date.now();
-  db.prepare(
+  await query(
     `INSERT INTO catering_leads
        (id, name, phone, email, event_date, guests, location, budget, preferences, message, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    id,
-    input.name,
-    input.phone,
-    input.email,
-    input.eventDate ?? "",
-    input.guests ?? "",
-    input.location ?? "",
-    input.budget ?? "",
-    input.preferences ?? "",
-    input.message ?? "",
-    createdAt,
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+    [
+      id,
+      input.name,
+      input.phone,
+      input.email,
+      input.eventDate ?? "",
+      input.guests ?? "",
+      input.location ?? "",
+      input.budget ?? "",
+      input.preferences ?? "",
+      input.message ?? "",
+      createdAt,
+    ],
   );
   return { id, createdAt, ...input };
 }
 
-export function listCateringLeads(): CateringLeadDTO[] {
-  const rows = db.prepare("SELECT * FROM catering_leads ORDER BY created_at DESC").all() as Array<{
+export async function listCateringLeads(): Promise<CateringLeadDTO[]> {
+  const rows = await query<{
     id: string;
     name: string;
     phone: string;
@@ -54,7 +55,7 @@ export function listCateringLeads(): CateringLeadDTO[] {
     preferences: string;
     message: string;
     created_at: number;
-  }>;
+  }>("SELECT * FROM catering_leads ORDER BY created_at DESC");
   return rows.map((r) => ({
     id: r.id,
     name: r.name,

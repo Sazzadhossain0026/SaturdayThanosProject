@@ -1,5 +1,5 @@
 import crypto from "crypto";
-import { db } from "./db";
+import { query } from "./db";
 
 /**
  * A local stand-in for Twilio. Messages never leave the process — they're
@@ -55,28 +55,31 @@ function statusCallbackUrl(): string {
  * delivering status=delivered a moment later, through the same verified
  * handler the real HTTP route uses.
  */
-export function sendSms(orderId: string, toPhone: string, body: string, kind: SmsKind) {
+export async function sendSms(orderId: string, toPhone: string, body: string, kind: SmsKind) {
   const sid = `SM${crypto.randomBytes(16).toString("hex")}`;
-  db.prepare(
+  await query(
     `INSERT INTO sms_events (id, order_id, to_phone, body, kind, twilio_sid, status, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)`,
-  ).run(crypto.randomUUID(), orderId, toPhone, body, kind, sid, Date.now());
+     VALUES ($1, $2, $3, $4, $5, $6, 'queued', $7)`,
+    [crypto.randomUUID(), orderId, toPhone, body, kind, sid, Date.now()],
+  );
 
   setTimeout(() => {
     const url = statusCallbackUrl();
     const params = { MessageSid: sid, MessageStatus: "delivered", To: toPhone, From: FROM_NUMBER };
     const signature = signTwilioRequest(url, params);
-    verifyAndHandleTwilioStatusCallback(url, params, signature);
+    verifyAndHandleTwilioStatusCallback(url, params, signature).catch((err) =>
+      console.error("simulated twilio status callback failed", err),
+    );
   }, 400);
 
   return { sid, status: "queued" as const };
 }
 
-export function verifyAndHandleTwilioStatusCallback(
+export async function verifyAndHandleTwilioStatusCallback(
   url: string,
   params: Record<string, string>,
   signatureHeader: string | null,
-): { ok: true; duplicate: boolean } | { ok: false; error: string } {
+): Promise<{ ok: true; duplicate: boolean } | { ok: false; error: string }> {
   if (!verifyTwilioSignature(url, params, signatureHeader)) {
     return { ok: false, error: "invalid signature" };
   }
@@ -87,22 +90,22 @@ export function verifyAndHandleTwilioStatusCallback(
   // UNIQUE(twilio_sid, status) means a repeat of the *same* status is a
   // no-op; a genuinely new status (queued -> delivered -> undelivered) still
   // gets recorded.
-  const inserted = db
-    .prepare(
-      `INSERT OR IGNORE INTO sms_status_events (id, twilio_sid, status, received_at) VALUES (?, ?, ?, ?)`,
-    )
-    .run(crypto.randomUUID(), MessageSid, MessageStatus, Date.now());
+  const inserted = await query(
+    `INSERT INTO sms_status_events (id, twilio_sid, status, received_at)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (twilio_sid, status) DO NOTHING
+     RETURNING id`,
+    [crypto.randomUUID(), MessageSid, MessageStatus, Date.now()],
+  );
 
-  if (inserted.changes === 0) {
+  if (inserted.length === 0) {
     return { ok: true, duplicate: true };
   }
 
-  db.prepare("UPDATE sms_events SET status = ? WHERE twilio_sid = ?").run(MessageStatus, MessageSid);
+  await query("UPDATE sms_events SET status = $1 WHERE twilio_sid = $2", [MessageStatus, MessageSid]);
   return { ok: true, duplicate: false };
 }
 
-export function getSmsEventsForOrder(orderId: string) {
-  return db
-    .prepare("SELECT * FROM sms_events WHERE order_id = ? ORDER BY created_at ASC")
-    .all(orderId);
+export async function getSmsEventsForOrder(orderId: string) {
+  return query("SELECT * FROM sms_events WHERE order_id = $1 ORDER BY created_at ASC", [orderId]);
 }

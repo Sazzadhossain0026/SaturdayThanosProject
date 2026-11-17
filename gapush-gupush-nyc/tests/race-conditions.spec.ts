@@ -1,7 +1,7 @@
 import { test, expect } from "@playwright/test";
-import { checkoutPayload, resetDemo } from "./helpers/api";
+import { checkoutPayload, loginAsOwner, resetDemo } from "./helpers/api";
 import { buildStripeSucceededEvent, signStripeEvent } from "./helpers/stripe";
-import { getSmsEventsForOrder, openTestDb } from "./helpers/db";
+import { getSmsEventsForOrder } from "./helpers/db";
 
 /**
  * These tests exist because the task was explicitly: "audit the order flow
@@ -13,6 +13,7 @@ import { getSmsEventsForOrder, openTestDb } from "./helpers/db";
 test.describe("Race condition: two customers buying the last item", () => {
   test.beforeEach(async ({ request }) => {
     await resetDemo(request);
+    await loginAsOwner(request);
   });
 
   test("exactly stock-many concurrent checkouts succeed, the rest are told sold out", async ({ request }) => {
@@ -80,6 +81,7 @@ test.describe("Race condition: two customers buying the last item", () => {
 test.describe("Race condition: a Stripe webhook arriving twice", () => {
   test.beforeEach(async ({ request }) => {
     await resetDemo(request);
+    await loginAsOwner(request);
   });
 
   test("a duplicate webhook delivery does not double-confirm the order or double-send SMS", async ({ request }) => {
@@ -120,15 +122,10 @@ test.describe("Race condition: a Stripe webhook arriving twice", () => {
     const { order: finalOrder } = await orderRes.json();
     expect(finalOrder.status).toBe("confirmed");
 
-    const db = openTestDb();
-    try {
-      const smsEvents = getSmsEventsForOrder(db, order.id);
-      const receivedSms = smsEvents.filter((e) => e.kind === "order_received");
-      expect(receivedSms, "exactly one SMS should have gone out despite two webhook deliveries").toHaveLength(1);
-      expect(receivedSms[0].body).toBe(`Gapush Gupush: We received order ${order.orderNumber}. We'll text you when it's ready.`);
-    } finally {
-      db.close();
-    }
+    const smsEvents = await getSmsEventsForOrder(order.id);
+    const receivedSms = smsEvents.filter((e) => e.kind === "order_received");
+    expect(receivedSms, "exactly one SMS should have gone out despite two webhook deliveries").toHaveLength(1);
+    expect(receivedSms[0].body).toBe(`Gapush Gupush: We received order ${order.orderNumber}. We'll text you when it's ready.`);
   });
 
   test("an invalid webhook signature is rejected outright", async ({ request }) => {
@@ -144,6 +141,7 @@ test.describe("Race condition: a Stripe webhook arriving twice", () => {
 test.describe("Race condition: kitchen marks an order ready before payment confirms", () => {
   test.beforeEach(async ({ request }) => {
     await resetDemo(request);
+    await loginAsOwner(request);
   });
 
   test("ready/accept are rejected while the order is still pending_payment", async ({ request }) => {

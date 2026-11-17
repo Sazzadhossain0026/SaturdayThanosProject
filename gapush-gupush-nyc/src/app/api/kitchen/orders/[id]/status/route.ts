@@ -13,7 +13,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   }
 
   try {
-    const order = applyKitchenAction(id, action);
+    const order = await applyKitchenAction(id, action);
     return NextResponse.json({ order });
   } catch (err) {
     if (err instanceof OrderNotFoundError) {

@@ -1,5 +1,5 @@
 import crypto from "crypto";
-import { db } from "./db";
+import { query } from "./db";
 import { confirmOrderPayment, failOrderPayment } from "./orders";
 
 /**
@@ -33,13 +33,14 @@ export interface CreatedPaymentIntent {
   amountCents: number;
 }
 
-export function createPaymentIntent(orderId: string, amountCents: number): CreatedPaymentIntent {
+export async function createPaymentIntent(orderId: string, amountCents: number): Promise<CreatedPaymentIntent> {
   const id = `pi_${crypto.randomBytes(12).toString("hex")}`;
   const clientSecret = `${id}_secret_${crypto.randomBytes(8).toString("hex")}`;
-  db.prepare(
+  await query(
     `INSERT INTO payment_intents (id, order_id, amount_cents, status, created_at)
-     VALUES (?, ?, ?, 'requires_confirmation', ?)`,
-  ).run(id, orderId, amountCents, Date.now());
+     VALUES ($1, $2, $3, 'requires_confirmation', $4)`,
+    [id, orderId, amountCents, Date.now()],
+  );
   return { id, clientSecret, amountCents };
 }
 
@@ -96,18 +97,19 @@ function buildEvent(type: StripeEventType, paymentIntentId: string, errorMessage
  * The single entry point real Stripe webhook deliveries AND our in-process
  * simulated deliveries both go through. Idempotency (the fix for "webhook
  * arrives twice") lives here: payment_events.stripe_event_id is UNIQUE, so a
- * duplicate delivery's INSERT fails the uniqueness check and we bail out
- * before touching order state or sending another SMS.
+ * duplicate delivery's INSERT is ignored and we bail out before touching
+ * order state or sending another SMS.
  */
-export function handleStripeEvent(event: StripeEvent): { duplicate: boolean } {
-  const inserted = db
-    .prepare(
-      `INSERT OR IGNORE INTO payment_events (stripe_event_id, type, payment_intent_id, received_at)
-       VALUES (?, ?, ?, ?)`,
-    )
-    .run(event.id, event.type, event.data.object.id, Date.now());
+export async function handleStripeEvent(event: StripeEvent): Promise<{ duplicate: boolean }> {
+  const inserted = await query(
+    `INSERT INTO payment_events (stripe_event_id, type, payment_intent_id, received_at)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (stripe_event_id) DO NOTHING
+     RETURNING stripe_event_id`,
+    [event.id, event.type, event.data.object.id, Date.now()],
+  );
 
-  if (inserted.changes === 0) {
+  if (inserted.length === 0) {
     // We've already processed this exact event id. Stripe explicitly
     // recommends this pattern because at-least-once delivery means retries
     // (network blips, slow 2xx, redeployments) are normal, not exceptional.
@@ -115,17 +117,17 @@ export function handleStripeEvent(event: StripeEvent): { duplicate: boolean } {
   }
 
   if (event.type === "payment_intent.succeeded") {
-    confirmOrderPayment(event.data.object.id);
+    await confirmOrderPayment(event.data.object.id);
   } else if (event.type === "payment_intent.payment_failed") {
-    failOrderPayment(event.data.object.id, event.data.object.last_payment_error?.message ?? "Payment failed");
+    await failOrderPayment(event.data.object.id, event.data.object.last_payment_error?.message ?? "Payment failed");
   }
   return { duplicate: false };
 }
 
-export function verifyAndHandleRawStripeWebhook(
+export async function verifyAndHandleRawStripeWebhook(
   rawBody: string,
   signatureHeader: string | null,
-): { ok: true; duplicate: boolean } | { ok: false; error: string } {
+): Promise<{ ok: true; duplicate: boolean } | { ok: false; error: string }> {
   if (!verifyStripeSignature(rawBody, signatureHeader)) {
     return { ok: false, error: "invalid signature" };
   }
@@ -135,7 +137,7 @@ export function verifyAndHandleRawStripeWebhook(
   } catch {
     return { ok: false, error: "invalid JSON" };
   }
-  const { duplicate } = handleStripeEvent(event);
+  const { duplicate } = await handleStripeEvent(event);
   return { ok: true, duplicate };
 }
 
@@ -150,10 +152,10 @@ export function verifyAndHandleRawStripeWebhook(
  * in CLAUDE.md and the /api/checkout/confirm route for how the UI handles
  * that gap (optimistic "confirming..." state, not "confirmed").
  */
-export function confirmPaymentIntent(
+export async function confirmPaymentIntent(
   paymentIntentId: string,
   cardNumber: string,
-): { outcome: "succeed" } | { outcome: "decline"; code: string; message: string } {
+): Promise<{ outcome: "succeed" } | { outcome: "decline"; code: string; message: string }> {
   const digits = cardNumber.replace(/\s+/g, "");
   const result = TEST_CARDS[digits] ?? {
     outcome: "decline" as const,
@@ -161,12 +163,12 @@ export function confirmPaymentIntent(
     message: "Use a Stripe test card number, e.g. 4242 4242 4242 4242.",
   };
 
-  db.prepare("UPDATE payment_intents SET status = ? WHERE id = ?").run(
+  await query("UPDATE payment_intents SET status = $1 WHERE id = $2", [
     result.outcome === "succeed" ? "succeeded" : "requires_payment_method",
     paymentIntentId,
-  );
+  ]);
 
-  const deliverWebhook = () => {
+  const deliverWebhook = async () => {
     const event = buildEvent(
       result.outcome === "succeed" ? "payment_intent.succeeded" : "payment_intent.payment_failed",
       paymentIntentId,
@@ -178,12 +180,14 @@ export function confirmPaymentIntent(
     // In dev/tests we call the same verified handler a real HTTP delivery
     // would hit — see /api/webhooks/stripe/route.ts, which does the same
     // verifyAndHandleRawStripeWebhook(rawBody, header) call.
-    verifyAndHandleRawStripeWebhook(rawBody, signature);
+    await verifyAndHandleRawStripeWebhook(rawBody, signature);
   };
 
   // ~600ms mirrors the real gap between "Stripe.js confirmCardPayment()
   // resolves" and "your webhook endpoint gets POSTed to" in production.
-  setTimeout(deliverWebhook, 600);
+  setTimeout(() => {
+    deliverWebhook().catch((err) => console.error("simulated stripe webhook delivery failed", err));
+  }, 600);
 
   return result;
 }

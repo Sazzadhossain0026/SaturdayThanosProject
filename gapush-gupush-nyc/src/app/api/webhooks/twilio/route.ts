@@ -14,7 +14,7 @@ export async function POST(request: NextRequest) {
   const signature = request.headers.get("x-twilio-signature");
   const url = `${request.nextUrl.origin}${request.nextUrl.pathname}`;
 
-  const result = verifyAndHandleTwilioStatusCallback(url, params, signature);
+  const result = await verifyAndHandleTwilioStatusCallback(url, params, signature);
   if (!result.ok) {
     console.warn("twilio webhook rejected:", result.error);
     return NextResponse.json({ error: result.error }, { status: 400 });

@@ -23,7 +23,7 @@ export async function GET(request: NextRequest) {
     });
   }
 
-  resetDemoData();
+  await resetDemoData();
 
   return new NextResponse(
     page(

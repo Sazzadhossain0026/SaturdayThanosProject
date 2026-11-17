@@ -9,6 +9,7 @@ const LINKS = [
   { href: "/admin/insights", label: "Insights", shortLabel: "Insights", icon: "📈" },
   { href: "/admin/customers", label: "Customers", shortLabel: "Customers", icon: "👥" },
   { href: "/admin/catering", label: "Catering", shortLabel: "Catering", icon: "🎉" },
+  { href: "/admin/staff", label: "Staff Accounts", shortLabel: "Staff", icon: "🔐" },
 ];
 
 export function AdminNav() {

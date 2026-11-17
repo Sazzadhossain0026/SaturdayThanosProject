@@ -1,5 +1,5 @@
 import crypto from "crypto";
-import { db } from "./db";
+import { query, withTransaction } from "./db";
 import { getMenuItem, TAX_RATE } from "@/lib/menu-data";
 import { EXTRA_PRICES } from "@/lib/cart";
 import { reserveInventory, releaseInventory, SoldOutError } from "./inventory";
@@ -12,17 +12,6 @@ export interface CreateOrderResult {
   order: OrderDTO;
   paymentIntent: { id: string; clientSecret: string; amountCents: number } | null;
 }
-
-// Single source of truth for the two customer-facing SMS bodies — these
-// used to be copy-pasted at both call sites (pay-at-pickup's immediate
-// send and the webhook-driven confirm), which is exactly the kind of
-// thing that quietly drifts apart after one gets edited and the other
-// doesn't. tests/order-flow.spec.ts asserts these exact strings.
-const smsBody = {
-  received: (orderNumber: string) =>
-    `Gapush Gupush: We received order ${orderNumber}. We'll text you when it's ready.`,
-  ready: (orderNumber: string) => `Gapush Gupush: Your order ${orderNumber} is READY for pickup!`,
-};
 
 export { SoldOutError };
 
@@ -38,6 +27,17 @@ export class InvalidTransitionError extends Error {
   }
 }
 
+// Single source of truth for the two customer-facing SMS bodies — these
+// used to be copy-pasted at both call sites (pay-at-pickup's immediate
+// send and the webhook-driven confirm), which is exactly the kind of
+// thing that quietly drifts apart after one gets edited and the other
+// doesn't. tests/order-flow.spec.ts asserts these exact strings.
+const smsBody = {
+  received: (orderNumber: string) =>
+    `Gapush Gupush: We received order ${orderNumber}. We'll text you when it's ready.`,
+  ready: (orderNumber: string) => `Gapush Gupush: Your order ${orderNumber} is READY for pickup!`,
+};
+
 /**
  * ---------------------------------------------------------------------------
  * ORDER STATE MACHINE (see CLAUDE.md for the diagram + full rationale)
@@ -49,11 +49,13 @@ export class InvalidTransitionError extends Error {
  *   ready            --(kitchen: complete)--> completed
  *
  * Pay-at-pickup orders skip straight to `confirmed` at creation (there is no
- * payment step to wait on). Every kitchen action below is only legal from
- * one specific prior status — that table (KITCHEN_TRANSITIONS) is the fix
- * for "kitchen marks an order ready before payment confirms": an order
- * sitting in pending_payment has no valid `ready` transition, so the attempt
- * is rejected with a 409, not silently accepted.
+ * payment step to wait on). Every kitchen action below only succeeds as an
+ * atomic `UPDATE ... WHERE status = <required-from-status>` — that single
+ * statement is both the fix for "two kitchen devices tap the same button at
+ * once" and for "kitchen marks an order ready before payment confirms": an
+ * order sitting in pending_payment has no row matching `WHERE status =
+ * 'preparing'`, so the attempt affects zero rows and is rejected with a 409,
+ * not silently accepted.
  * ---------------------------------------------------------------------------
  */
 const KITCHEN_TRANSITIONS: Record<string, { from: OrderStatus; to: OrderStatus }> = {
@@ -81,25 +83,28 @@ function priceLine(item: CreateOrderInput["items"][number]) {
 /**
  * Creates an order. Prices are computed server-side from the menu (never
  * trusted from the client) and inventory is reserved atomically as part of
- * the same DB transaction — if any line is sold out, nothing is written:
- * no partial order, no partially-decremented stock.
+ * the same DB transaction as the order-number claim and the insert itself —
+ * if any line is sold out, the whole transaction rolls back: no partial
+ * order, no partially-decremented stock, no burned order number.
  */
-export function createOrder(input: CreateOrderInput): CreateOrderResult {
+export async function createOrder(input: CreateOrderInput): Promise<CreateOrderResult> {
   if (input.idempotencyKey) {
-    const existing = db
-      .prepare("SELECT id FROM orders WHERE idempotency_key = ?")
-      .get(input.idempotencyKey) as { id: string } | undefined;
-    if (existing) {
+    const existing = await query<{ id: string }>("SELECT id FROM orders WHERE idempotency_key = $1", [
+      input.idempotencyKey,
+    ]);
+    if (existing.length > 0) {
       // A retried checkout (see submitCheckoutWithRetry) whose earlier
       // attempt already landed — return the order that already exists
       // instead of charging/reserving stock a second time.
-      const order = getOrder(existing.id)!;
-      const intent =
+      const order = (await getOrder(existing[0].id))!;
+      const intentRows =
         order.paymentMethod === "online" && order.paymentIntentId
-          ? (db
-              .prepare("SELECT id, amount_cents FROM payment_intents WHERE id = ?")
-              .get(order.paymentIntentId) as { id: string; amount_cents: number } | undefined)
-          : undefined;
+          ? await query<{ id: string; amount_cents: number }>(
+              "SELECT id, amount_cents FROM payment_intents WHERE id = $1",
+              [order.paymentIntentId],
+            )
+          : [];
+      const intent = intentRows[0];
       return {
         order,
         paymentIntent: intent
@@ -116,135 +121,150 @@ export function createOrder(input: CreateOrderInput): CreateOrderResult {
   const taxCents = Math.round(subtotalCents * TAX_RATE);
   const totalCents = subtotalCents + taxCents;
   const status: OrderStatus = input.paymentMethod === "pickup" ? "confirmed" : "pending_payment";
-  const orderNumber = claimNextOrderNumber();
 
-  const run = db.transaction(() => {
-    reserveInventory(priced.map((l) => ({ menuItemId: l.menuItem.id, quantity: l.input.quantity })));
+  const orderNumber = await withTransaction(async (client) => {
+    const orderNumber = await claimNextOrderNumber(client);
 
-    db.prepare(
+    await reserveInventory(
+      client,
+      priced.map((l) => ({ menuItemId: l.menuItem.id, quantity: l.input.quantity })),
+    );
+
+    await client.query(
       `INSERT INTO orders
          (id, order_number, customer_name, phone, status, fulfillment, scheduled_time,
           payment_method, payment_intent_id, subtotal_cents, tax_cents, total_cents,
           created_at, updated_at, estimated_ready_at, is_demo, idempotency_key)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      id,
-      orderNumber,
-      input.customerName,
-      input.phone,
-      status,
-      input.fulfillment,
-      input.scheduledTime ?? null,
-      input.paymentMethod,
-      subtotalCents,
-      taxCents,
-      totalCents,
-      now,
-      now,
-      now + 20 * 60 * 1000,
-      input.isDemo ? 1 : 0,
-      input.idempotencyKey ?? null,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10, $11, $12, $13, $14, $15, $16)`,
+      [
+        id,
+        orderNumber,
+        input.customerName,
+        input.phone,
+        status,
+        input.fulfillment,
+        input.scheduledTime ?? null,
+        input.paymentMethod,
+        subtotalCents,
+        taxCents,
+        totalCents,
+        now,
+        now,
+        now + 20 * 60 * 1000,
+        input.isDemo ?? false,
+        input.idempotencyKey ?? null,
+      ],
     );
 
-    const insertItem = db.prepare(
-      `INSERT INTO order_items
-         (id, order_id, menu_item_id, name, quantity, unit_price_cents, line_total_cents,
-          spice_level, extras_json, instructions)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    );
     for (const line of priced) {
-      insertItem.run(
-        crypto.randomUUID(),
-        id,
-        line.menuItem.id,
-        line.menuItem.name,
-        line.input.quantity,
-        line.unitPriceCents,
-        line.lineTotalCents,
-        line.input.spiceLevel,
-        JSON.stringify(line.input.extras),
-        line.input.instructions ?? "",
+      await client.query(
+        `INSERT INTO order_items
+           (id, order_id, menu_item_id, name, quantity, unit_price_cents, line_total_cents,
+            spice_level, extras_json, instructions)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [
+          crypto.randomUUID(),
+          id,
+          line.menuItem.id,
+          line.menuItem.name,
+          line.input.quantity,
+          line.unitPriceCents,
+          line.lineTotalCents,
+          line.input.spiceLevel,
+          JSON.stringify(line.input.extras),
+          line.input.instructions ?? "",
+        ],
       );
     }
+
+    return orderNumber;
   });
-  run();
 
   let paymentIntent: { id: string; clientSecret: string; amountCents: number } | null = null;
   if (input.paymentMethod === "online") {
-    paymentIntent = createPaymentIntent(id, totalCents);
-    db.prepare("UPDATE orders SET payment_intent_id = ? WHERE id = ?").run(paymentIntent.id, id);
+    paymentIntent = await createPaymentIntent(id, totalCents);
+    await query("UPDATE orders SET payment_intent_id = $1 WHERE id = $2", [paymentIntent.id, id]);
   } else {
     // Pay at pickup has nothing to wait on — it's confirmed the instant the
     // kitchen can see it, so the "order received" SMS fires right away.
-    sendSms(id, input.phone, smsBody.received(orderNumber), "order_received");
+    await sendSms(id, input.phone, smsBody.received(orderNumber), "order_received");
   }
 
-  return { order: getOrder(id)!, paymentIntent };
+  return { order: (await getOrder(id))!, paymentIntent };
 }
 
 /** Called when the Stripe webhook says a PaymentIntent succeeded. */
-export function confirmOrderPayment(paymentIntentId: string): void {
-  const order = db
-    .prepare("SELECT * FROM orders WHERE payment_intent_id = ?")
-    .get(paymentIntentId) as OrderRow | undefined;
-  if (!order) return; // Unknown intent — nothing to do, but don't throw: webhooks must 200.
-  if (order.status !== "pending_payment") {
-    // Already confirmed (or already failed) — this is what makes a second,
-    // duplicate "succeeded" delivery a safe no-op instead of a double SMS.
-    return;
-  }
-  db.prepare("UPDATE orders SET status = 'confirmed', updated_at = ? WHERE id = ?").run(Date.now(), order.id);
-  sendSms(order.id, order.phone, smsBody.received(order.order_number), "order_received");
+export async function confirmOrderPayment(paymentIntentId: string): Promise<void> {
+  // One atomic UPDATE...WHERE status='pending_payment' closes the same
+  // TOCTOU gap the inventory fix does: two "succeeded" events for the same
+  // intent (a legitimate retry with a different event id, say) can't both
+  // see status='pending_payment' and both fire a confirmation — only the
+  // one whose UPDATE actually matches a row gets to send the SMS.
+  const rows = await query<{ id: string; order_number: string; phone: string }>(
+    `UPDATE orders SET status = 'confirmed', updated_at = $1
+     WHERE payment_intent_id = $2 AND status = 'pending_payment'
+     RETURNING id, order_number, phone`,
+    [Date.now(), paymentIntentId],
+  );
+  const order = rows[0];
+  if (!order) return; // Unknown intent, or already confirmed/failed — safe no-op.
+  await sendSms(order.id, order.phone, smsBody.received(order.order_number), "order_received");
 }
 
 /** Called when the Stripe webhook says a PaymentIntent failed. */
-export function failOrderPayment(paymentIntentId: string, reason: string): void {
-  const order = db
-    .prepare("SELECT * FROM orders WHERE payment_intent_id = ?")
-    .get(paymentIntentId) as OrderRow | undefined;
+export async function failOrderPayment(paymentIntentId: string, reason: string): Promise<void> {
+  const rows = await query<{ id: string; order_number: string }>(
+    `UPDATE orders SET status = 'payment_failed', updated_at = $1
+     WHERE payment_intent_id = $2 AND status = 'pending_payment'
+     RETURNING id, order_number`,
+    [Date.now(), paymentIntentId],
+  );
+  const order = rows[0];
   if (!order) return;
-  if (order.status !== "pending_payment") return;
   console.info(`payment failed for order ${order.order_number}: ${reason}`);
 
-  const items = db
-    .prepare("SELECT menu_item_id, quantity FROM order_items WHERE order_id = ?")
-    .all(order.id) as { menu_item_id: string; quantity: number }[];
-
-  const run = db.transaction(() => {
-    db.prepare("UPDATE orders SET status = 'payment_failed', updated_at = ? WHERE id = ?").run(
-      Date.now(),
-      order.id,
-    );
-    // Give the reserved stock back — a declined card must not permanently
-    // hold inventory hostage.
-    releaseInventory(items.map((i) => ({ menuItemId: i.menu_item_id, quantity: i.quantity })));
-  });
-  run();
+  const items = await query<{ menu_item_id: string; quantity: number }>(
+    "SELECT menu_item_id, quantity FROM order_items WHERE order_id = $1",
+    [order.id],
+  );
+  // Give the reserved stock back — a declined card must not permanently
+  // hold inventory hostage.
+  await withTransaction((client) =>
+    releaseInventory(
+      client,
+      items.map((i) => ({ menuItemId: i.menu_item_id, quantity: i.quantity })),
+    ),
+  );
 }
 
-export function applyKitchenAction(orderId: string, action: keyof typeof KITCHEN_TRANSITIONS): OrderDTO {
+export async function applyKitchenAction(
+  orderId: string,
+  action: keyof typeof KITCHEN_TRANSITIONS,
+): Promise<OrderDTO> {
   const transition = KITCHEN_TRANSITIONS[action];
   if (!transition) throw new Error(`Unknown kitchen action: ${action}`);
 
-  const run = db.transaction(() => {
-    const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(orderId) as OrderRow | undefined;
-    if (!order) throw new OrderNotFoundError(orderId);
-    if (order.status !== transition.from) {
-      throw new InvalidTransitionError(order.status as OrderStatus, action);
-    }
-    db.prepare("UPDATE orders SET status = ?, updated_at = ? WHERE id = ?").run(
-      transition.to,
-      Date.now(),
-      orderId,
-    );
-  });
-  run();
+  const rows = await query(
+    `UPDATE orders SET status = $1, updated_at = $2 WHERE id = $3 AND status = $4 RETURNING id`,
+    [transition.to, Date.now(), orderId, transition.from],
+  );
 
-  const updated = getOrder(orderId)!;
-  if (transition.to === "ready") {
-    sendSms(updated.id, updated.phone, smsBody.ready(updated.orderNumber), "order_ready");
+  if (rows.length === 0) {
+    // The UPDATE matched nothing — find out why, just to give a good error.
+    // This lookup is NOT what makes the transition safe (the atomic UPDATE
+    // above is); it only decides which error to throw.
+    const existing = await query<{ status: OrderStatus }>("SELECT status FROM orders WHERE id = $1", [
+      orderId,
+    ]);
+    if (existing.length === 0) throw new OrderNotFoundError(orderId);
+    throw new InvalidTransitionError(existing[0].status, action);
   }
-  return getOrder(orderId)!;
+
+  const updated = (await getOrder(orderId))!;
+  if (transition.to === "ready") {
+    await sendSms(updated.id, updated.phone, smsBody.ready(updated.orderNumber), "order_ready");
+  }
+  return updated;
 }
 
 interface OrderRow {
@@ -263,7 +283,7 @@ interface OrderRow {
   created_at: number;
   updated_at: number;
   estimated_ready_at: number;
-  is_demo: number;
+  is_demo: boolean;
 }
 
 interface OrderItemRow {
@@ -313,25 +333,29 @@ function rowToDto(order: OrderRow, items: OrderItemRow[]): OrderDTO {
   };
 }
 
-export function getOrder(id: string): OrderDTO | null {
-  const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(id) as OrderRow | undefined;
+export async function getOrder(id: string): Promise<OrderDTO | null> {
+  const orders = await query<OrderRow>("SELECT * FROM orders WHERE id = $1", [id]);
+  const order = orders[0];
   if (!order) return null;
-  const items = db.prepare("SELECT * FROM order_items WHERE order_id = ?").all(id) as OrderItemRow[];
+  const items = await query<OrderItemRow>("SELECT * FROM order_items WHERE order_id = $1", [id]);
   return rowToDto(order, items);
 }
 
-export function getOrderByNumber(orderNumber: string): OrderDTO | null {
-  const order = db.prepare("SELECT * FROM orders WHERE order_number = ?").get(orderNumber) as
-    | OrderRow
-    | undefined;
+export async function getOrderByNumber(orderNumber: string): Promise<OrderDTO | null> {
+  const orders = await query<OrderRow>("SELECT * FROM orders WHERE order_number = $1", [orderNumber]);
+  const order = orders[0];
   if (!order) return null;
   return getOrder(order.id);
 }
 
-export function listOrders(): OrderDTO[] {
-  const orders = db.prepare("SELECT * FROM orders ORDER BY created_at DESC").all() as OrderRow[];
-  const itemStmt = db.prepare("SELECT * FROM order_items WHERE order_id = ?");
-  return orders.map((order) => rowToDto(order, itemStmt.all(order.id) as OrderItemRow[]));
+export async function listOrders(): Promise<OrderDTO[]> {
+  const orders = await query<OrderRow>("SELECT * FROM orders ORDER BY created_at DESC");
+  const out: OrderDTO[] = [];
+  for (const order of orders) {
+    const items = await query<OrderItemRow>("SELECT * FROM order_items WHERE order_id = $1", [order.id]);
+    out.push(rowToDto(order, items));
+  }
+  return out;
 }
 
 export interface CustomerSummary {
@@ -348,17 +372,16 @@ export interface CustomerSummary {
 // someone look like a repeat customer in the CRM.
 const REALIZED_STATUSES: OrderStatus[] = ["confirmed", "preparing", "ready", "completed"];
 
-export function listCustomers(): CustomerSummary[] {
-  const placeholders = REALIZED_STATUSES.map(() => "?").join(",");
-  const orders = db
-    .prepare(`SELECT * FROM orders WHERE status IN (${placeholders}) ORDER BY created_at ASC`)
-    .all(...REALIZED_STATUSES) as OrderRow[];
+export async function listCustomers(): Promise<CustomerSummary[]> {
+  const orders = await query<OrderRow>(
+    `SELECT * FROM orders WHERE status = ANY($1::text[]) ORDER BY created_at ASC`,
+    [REALIZED_STATUSES],
+  );
 
   const byPhone = new Map<
     string,
     { name: string; totalOrders: number; totalSpentCents: number; lastOrderAt: number; itemCounts: Map<string, number> }
   >();
-  const itemStmt = db.prepare("SELECT name, quantity FROM order_items WHERE order_id = ?");
 
   for (const order of orders) {
     const entry = byPhone.get(order.phone) ?? {
@@ -372,7 +395,11 @@ export function listCustomers(): CustomerSummary[] {
     entry.totalOrders += 1;
     entry.totalSpentCents += order.total_cents;
     entry.lastOrderAt = Math.max(entry.lastOrderAt, order.created_at);
-    for (const item of itemStmt.all(order.id) as { name: string; quantity: number }[]) {
+    const items = await query<{ name: string; quantity: number }>(
+      "SELECT name, quantity FROM order_items WHERE order_id = $1",
+      [order.id],
+    );
+    for (const item of items) {
       entry.itemCounts.set(item.name, (entry.itemCounts.get(item.name) ?? 0) + item.quantity);
     }
     byPhone.set(order.phone, entry);
